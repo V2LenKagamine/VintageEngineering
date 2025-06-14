@@ -1,12 +1,18 @@
 ﻿using System;
 using VintageEngineering.blockBhv;
 using VintageEngineering.Electrical;
+using VintageEngineering.GUI;
+using Vintagestory.API.Client;
 using Vintagestory.API.Common;
+using Vintagestory.API.Config;
+using Vintagestory.API.Datastructures;
+using Vintagestory.API.Util;
+using Vintagestory.GameContent.Mechanics;
 
 
 namespace VintageEngineering.blockentity
 {
-    public class BEElectricKinetic : ElectricSimpleBE
+    public class BEElectricKinetic : ElectricContainerBE
     {
 
         public bool isGenerator { get { return Block.Code.Path.Contains("alternator"); } }
@@ -20,6 +26,59 @@ namespace VintageEngineering.blockentity
 
         private float sleepTimer = 0;
 
+        private float _speedSetting = 0.0f;
+        private float _resistanceSetting = 0.0f;
+
+        GUILVMotor clientDialog;
+
+        /// <summary>
+        /// What the current Speed is set to for this Motor<br/>
+        /// Not used for the Alternator
+        /// </summary>
+        public float SpeedSetting { get { return _speedSetting; } set { _speedSetting = value; } }
+        /// <summary>
+        /// What the Resistance is set to for this Motor<br/>
+        /// Not used for the Alternator
+        /// </summary>
+        public float ResistanceSetting { get { return _resistanceSetting; } set { _resistanceSetting = value; } }
+
+        public BEBehaviorMPBase Mechanical
+        {
+            get
+            {
+                if (isGenerator)
+                {
+                    return consBhv;
+                }
+                else
+                {
+                    return genBhv;
+                }
+            }
+        }
+
+        private string DialogTitle = Lang.Get("vinteng:gui-title-motor");
+        private InventoryGeneric inventory;
+        public override InventoryBase Inventory => inventory;
+        public BEElectricKinetic()
+        {
+            inventory = new InventoryGeneric(1, null, null, null);
+        }
+        public override string InventoryClassName => "VintEngElectricKinetic";
+        public override bool OnPlayerRightClick(IPlayer byPlayer, BlockSelection blockSel)
+        {
+            if (!isGenerator && this.Api != null && Api.Side == EnumAppSide.Client)
+            {
+                base.toggleInventoryDialogClient(byPlayer, delegate
+                {
+                    clientDialog = new GUILVMotor(DialogTitle, Inventory, this.Pos, base.Api as ICoreClientAPI, this);
+                    clientDialog.Update(Electric.CurrentPower, _speedSetting, _resistanceSetting);
+                    return this.clientDialog;
+                });
+            }
+            return true;
+        }
+
         public override void Initialize(ICoreAPI api)
         {
             base.Initialize(api);
@@ -28,6 +87,9 @@ namespace VintageEngineering.blockentity
             {
                 RegisterGameTickListener(OnSimTick, 100, 0);
             }
+            inventory.Pos = this.Pos.Copy();
+            inventory.LateInitialize($"{InventoryClassName}-{this.Pos.X}/{this.Pos.Y}/{this.Pos.Z}", api);
+
             _clientUpdateMS = api.World.ElapsedMilliseconds;
         }
         public void OnSimTick(float dt)
@@ -55,7 +117,7 @@ namespace VintageEngineering.blockentity
                 if (Electric.CurrentPower == 0 || Electric.CurrentPower < PPT) { return; }
                 if(genBhv != null)
                 {
-                    Single powerwanted = genBhv.GetMechanicalPowerRequired();
+                    Single powerwanted = genBhv.GetElectricalPowerRequired();
                     if (Electric.CurrentPower < powerwanted)
                     {
                         // if this is out of power, then it should just stop providing mechanical power
@@ -64,7 +126,7 @@ namespace VintageEngineering.blockentity
                     }
                     else
                     {
-                        Single consumed = genBhv.GetMechanicalPowerRequired();
+                        Single consumed = genBhv.GetElectricalPowerRequired();
                         genBhv.ConsumePower(consumed);
                         Electric.electricpower -= (ulong)Math.Round(consumed);
                     }
@@ -84,6 +146,74 @@ namespace VintageEngineering.blockentity
             consBhv = GetBehavior<ElectricKineticAlternatorBhv>();
             genBhv = GetBehavior<ElectricKineticMotorBhv>();
         }
+        protected virtual void SetState(EnumBEState newstate)
+        {
+            //if (MachineState == newstate) return; // no change, nothing to see here.
+            Electric.MachineState = newstate;
 
+            if (Api != null && Api.Side == EnumAppSide.Client && clientDialog != null && clientDialog.IsOpened())
+            {
+                clientDialog.Update(Electric.CurrentPower, _speedSetting, _resistanceSetting);
+            }
+            MarkDirty(true);
+        }
+
+        #region ServerClientStuff
+        public override void OnReceivedClientPacket(IPlayer player, int packetid, byte[] data)
+        {
+            base.OnReceivedClientPacket(player, packetid, data);
+            if (packetid == 1002) // Enable Button
+            {
+                if (Electric.IsEnabled) SetState(EnumBEState.Off); // turn off
+                else
+                {
+                    SetState(EnumBEState.On);
+                }
+                MarkDirty(true, null);
+            }
+            if (packetid == 1004)
+            {
+                // new Speed setting
+                int newspeed = SerializerUtil.Deserialize<int>(data);
+                _speedSetting = (float)newspeed / 100;
+                MarkDirty(true);
+            }
+            if (packetid == 1005)
+            {
+                // new Resistance setting
+                int newresist = SerializerUtil.Deserialize<int>(data);
+                _resistanceSetting = (float)newresist / 100;
+                MarkDirty(true);
+            }
+        }
+
+        public override void OnReceivedServerPacket(int packetid, byte[] data)
+        {
+            base.OnReceivedServerPacket(packetid, data);
+            if (clientDialog != null && clientDialog.IsOpened()) clientDialog.Update(Electric.CurrentPower, _speedSetting, _resistanceSetting);
+        }
+
+        public override void ToTreeAttributes(ITreeAttribute tree)
+        {
+            base.ToTreeAttributes(tree);
+            tree.SetFloat("speed", _speedSetting);
+            tree.SetFloat("resistance", _resistanceSetting);
+        }
+        public override void FromTreeAttributes(ITreeAttribute tree, IWorldAccessor worldAccessForResolve)
+        {
+            try
+            {
+                base.FromTreeAttributes(tree, worldAccessForResolve);
+                _speedSetting = tree.GetFloat("speed", 0.0f);
+                _resistanceSetting = tree.GetFloat("resistance", 0.0f);
+                if (Api != null && Api.Side == EnumAppSide.Client) { SetState(Electric.MachineState); }
+                if (clientDialog != null)
+                {
+                    clientDialog.Update(Electric.CurrentPower, _speedSetting, _resistanceSetting);
+                }
+            }
+            catch (Exception) { }
+        }
+        #endregion
     }
 }
